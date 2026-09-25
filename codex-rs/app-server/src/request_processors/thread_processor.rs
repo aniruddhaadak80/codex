@@ -3297,9 +3297,7 @@ impl ThreadRequestProcessor {
                 })
                 .await
                 .map_err(paginated_history_list_error)?;
-            for item in page.items {
-                items.push(deserialize_stored_thread_item(item)?);
-            }
+            items.extend(page.items.iter().filter_map(deserialize_stored_thread_item));
             let Some(next_cursor) = page.next_cursor else {
                 return Ok(items);
             };
@@ -3462,19 +3460,16 @@ impl ThreadRequestProcessor {
         let data = page
             .items
             .into_iter()
-            .map(|stored_item| {
-                let turn_id = stored_item.turn_id.clone();
-                let started_at_ms = stored_item.started_at_ms;
-                let completed_at_ms = stored_item.completed_at_ms;
-                let item = deserialize_stored_thread_item(stored_item)?;
-                Ok(ThreadItemEntry {
-                    turn_id,
+            .filter_map(|stored_item| {
+                let item = deserialize_stored_thread_item(&stored_item)?;
+                Some(ThreadItemEntry {
+                    turn_id: stored_item.turn_id,
                     item,
-                    started_at_ms,
-                    completed_at_ms,
+                    started_at_ms: stored_item.started_at_ms,
+                    completed_at_ms: stored_item.completed_at_ms,
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
 
         Ok(ThreadItemsListResponse {
             data,
@@ -5827,15 +5822,24 @@ fn paginated_history_list_error(err: ThreadStoreError) -> JSONRPCErrorError {
     }
 }
 
+/// Deserializes a persisted thread item, skipping items this build cannot decode.
+///
+/// Persisted `item_json` is a compatibility surface shared by concurrently
+/// installed builds, so a newer build can persist an item carrying an enum variant
+/// this build does not know, such as a `subAgentActivity` `kind`. Surfacing that as
+/// a JSON-RPC error makes the whole thread unopenable, so log the item and drop it
+/// instead. See #47959.
 fn deserialize_stored_thread_item(
-    item: codex_thread_store::StoredThreadItem,
-) -> Result<ThreadItem, JSONRPCErrorError> {
-    serde_json::from_slice::<ThreadItem>(&item.item_json).map_err(|err| {
-        internal_error(format!(
-            "failed to deserialize stored thread item {}: {err}",
-            item.item_id
-        ))
-    })
+    item: &codex_thread_store::StoredThreadItem,
+) -> Option<ThreadItem> {
+    match serde_json::from_slice::<ThreadItem>(&item.item_json) {
+        Ok(item) => Some(item),
+        Err(err) => {
+            let item_id = &item.item_id;
+            warn!("skipping stored thread item {item_id} that failed to deserialize: {err}");
+            None
+        }
+    }
 }
 
 fn stored_turn_to_api_turn(
@@ -5854,11 +5858,11 @@ fn stored_turn_to_api_turn(
         codex_error_info: error.codex_error_info,
         additional_details: error.additional_details,
     });
-    let items = turn
+    let items: Vec<ThreadItem> = turn
         .items
-        .into_iter()
-        .map(deserialize_stored_thread_item)
-        .collect::<Result<Vec<_>, _>>()?;
+        .iter()
+        .filter_map(deserialize_stored_thread_item)
+        .collect();
     Ok(Turn {
         id: turn.turn_id,
         items,

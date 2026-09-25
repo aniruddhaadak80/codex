@@ -20,6 +20,7 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::SortDirection;
+use codex_app_server_protocol::SubAgentActivityKind;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
@@ -2179,6 +2180,166 @@ async fn thread_read_reports_system_error_idle_flag_after_failed_turn() -> Resul
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
 
     assert_eq!(thread.status, ThreadStatus::SystemError,);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_items_list_skips_items_with_unknown_variants() -> Result<()> {
+    let subagent_completed_id = "subagent-completed";
+    let subagent_unknown_id = "subagent-unknown";
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let thread_id = codex_protocol::ThreadId::default();
+    let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    let state_db =
+        codex_state::StateRuntime::init(sqlite.clone(), "mock_provider".to_string()).await?;
+    let store = LocalThreadStore::new(
+        LocalThreadStoreConfig {
+            codex_home: codex_home.path().to_path_buf(),
+            sqlite: sqlite.clone(),
+            default_model_provider_id: "mock_provider".to_string(),
+        },
+        Some(state_db),
+    );
+    store
+        .create_thread(CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: ProtocolSessionSource::Cli,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: codex_protocol::protocol::ThreadHistoryMode::Paginated,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            initial_window_id: Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(codex_home.path().to_path_buf()),
+                model_provider: "mock_provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await?;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await?;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                paginated_turn_started("turn-1"),
+                paginated_completed_item(
+                    thread_id,
+                    "turn-1",
+                    CoreTurnItem::UserMessage(UserMessageItem {
+                        id: "user-1".to_string(),
+                        client_id: None,
+                        content: Vec::new(),
+                    }),
+                ),
+                paginated_completed_item(
+                    thread_id,
+                    "turn-1",
+                    CoreTurnItem::AgentMessage(AgentMessageItem {
+                        id: "agent-1".to_string(),
+                        content: vec![AgentMessageContent::Text {
+                            text: "first".to_string(),
+                        }],
+                        phase: None,
+                        memory_citation: None,
+                        delivery: None,
+                        questions: None,
+                    }),
+                ),
+                paginated_completed_item(
+                    thread_id,
+                    "turn-1",
+                    CoreTurnItem::UserMessage(UserMessageItem {
+                        id: subagent_completed_id.to_string(),
+                        client_id: None,
+                        content: Vec::new(),
+                    }),
+                ),
+                paginated_completed_item(
+                    thread_id,
+                    "turn-1",
+                    CoreTurnItem::UserMessage(UserMessageItem {
+                        id: subagent_unknown_id.to_string(),
+                        client_id: None,
+                        content: Vec::new(),
+                    }),
+                ),
+                paginated_turn_completed("turn-1"),
+            ],
+        })
+        .await?;
+    store.shutdown_thread(thread_id).await?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    // Rewrite two rows into the persisted `subAgentActivity` shape a newer build
+    // sharing the same CODEX_HOME would have written: one carrying the `completed`
+    // kind reported in #47959, and one carrying a kind this build never emitted.
+    let pool = sqlite
+        .open_read_write_pool(&sqlite.thread_history_db_path())
+        .await?;
+    for (item_id, kind) in [
+        (subagent_completed_id, "completed"),
+        (subagent_unknown_id, "teleported"),
+    ] {
+        let item_json = json!({
+            "type": "subAgentActivity",
+            "id": item_id,
+            "kind": kind,
+            "agentThreadId": thread_id.to_string(),
+            "agentPath": "root/child",
+        })
+        .to_string();
+        sqlx::query(
+            "UPDATE thread_items SET item_json = ?, item_type = ? WHERE thread_id = ? AND item_id = ?",
+        )
+        .bind(item_json)
+        .bind("subAgentActivity")
+        .bind(thread_id.to_string())
+        .bind(item_id)
+        .execute(&pool)
+        .await?;
+    }
+    pool.close().await;
+
+    // The unreadable item must not fail the page. The readable items still come
+    // back, and the `completed` activity that #47959 reported survives.
+    let response =
+        read_items_page(&mut mcp, thread_id, None, None, Some(100), SortDirection::Asc).await?;
+    assert!(response.next_cursor.is_none());
+    let item_ids = response
+        .data
+        .iter()
+        .map(|entry| entry.item.id())
+        .collect::<Vec<_>>();
+    assert_eq!(item_ids, vec!["user-1", "agent-1", subagent_completed_id]);
+    assert!(matches!(
+        response.data.last().map(|entry| &entry.item),
+        Some(ThreadItem::SubAgentActivity {
+            kind: SubAgentActivityKind::Completed,
+            ..
+        })
+    ));
 
     Ok(())
 }
