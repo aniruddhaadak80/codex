@@ -3246,7 +3246,7 @@ impl ThreadRequestProcessor {
             })?;
         let mut turns = Vec::with_capacity(page.turns.len());
         for turn in page.turns {
-            let mut turn = stored_turn_to_api_turn(turn, items_view)?;
+            let mut turn = stored_turn_to_api_turn(turn, items_view);
             if matches!(items_view, TurnItemsView::Full) {
                 turn.items = self
                     .paginated_turn_full_items(thread_id, turn.id.as_str())
@@ -5827,21 +5827,28 @@ fn paginated_history_list_error(err: ThreadStoreError) -> JSONRPCErrorError {
     }
 }
 
-fn deserialize_stored_thread_item(
-    item: codex_thread_store::StoredThreadItem,
-) -> Result<ThreadItem, JSONRPCErrorError> {
-    serde_json::from_slice::<ThreadItem>(&item.item_json).map_err(|err| {
-        internal_error(format!(
-            "failed to deserialize stored thread item {}: {err}",
-            item.item_id
-        ))
-    })
+/// Decode a persisted item snapshot, skipping anything this build cannot read.
+///
+/// Stored snapshots outlive the binary that wrote them, so a newer Codex can
+/// persist an item shape, or an enum variant inside one, that an older build
+/// rejects. Letting a single undecodable item fail the whole read makes every
+/// thread that contains it unopenable, and the breakage stays on disk until the
+/// rows are repaired by hand, so drop the item and keep the thread readable.
+fn deserialize_stored_thread_item(item: codex_thread_store::StoredThreadItem) -> Option<ThreadItem> {
+    match serde_json::from_slice::<ThreadItem>(&item.item_json) {
+        Ok(item) => Some(item),
+        Err(err) => {
+            tracing::warn!(
+                item_id = %item.item_id,
+                error = %err,
+                "skipping stored thread item that this build cannot deserialize"
+            );
+            None
+        }
+    }
 }
 
-fn stored_turn_to_api_turn(
-    turn: StoredTurn,
-    items_view: TurnItemsView,
-) -> Result<Turn, JSONRPCErrorError> {
+fn stored_turn_to_api_turn(turn: StoredTurn, items_view: TurnItemsView) -> Turn {
     let status = match turn.status {
         StoredTurnStatus::Completed => TurnStatus::Completed,
         StoredTurnStatus::Interrupted => TurnStatus::Interrupted,
@@ -5857,9 +5864,9 @@ fn stored_turn_to_api_turn(
     let items = turn
         .items
         .into_iter()
-        .map(deserialize_stored_thread_item)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Turn {
+        .filter_map(deserialize_stored_thread_item)
+        .collect();
+    Turn {
         id: turn.turn_id,
         items,
         items_view,
@@ -5868,8 +5875,7 @@ fn stored_turn_to_api_turn(
         started_at: turn.started_at,
         completed_at: turn.completed_at,
         duration_ms: turn.duration_ms,
-    })
-}
+    }
 
 pub(super) fn unsupported_thread_store_operation(operation: &'static str) -> JSONRPCErrorError {
     method_not_found(format!("{operation} is not supported yet"))

@@ -1444,3 +1444,86 @@ mod thread_processor_behavior_tests {
         Ok(())
     }
 }
+
+mod stored_thread_item_forward_compat_tests {
+    use super::super::stored_turn_to_api_turn;
+    use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::TurnItemsView;
+    use codex_thread_store::StoredThreadItem;
+    use codex_thread_store::StoredTurn;
+    use codex_thread_store::StoredTurnItemsView;
+    use codex_thread_store::StoredTurnStatus;
+    use pretty_assertions::assert_eq;
+
+    fn stored_item(item_id: &str, item_json: &str) -> StoredThreadItem {
+        StoredThreadItem {
+            turn_id: "turn-1".to_string(),
+            item_id: item_id.to_string(),
+            updated_at_ordinal: 0,
+            created_at_ms: 0,
+            started_at_ms: None,
+            completed_at_ms: None,
+            item_json: item_json.as_bytes().to_vec(),
+        }
+    }
+
+    fn stored_turn(items: Vec<StoredThreadItem>) -> StoredTurn {
+        StoredTurn {
+            turn_id: "turn-1".to_string(),
+            items,
+            items_view: StoredTurnItemsView::Summary,
+            status: StoredTurnStatus::Completed,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+        }
+    }
+
+    fn agent_message() -> ThreadItem {
+        ThreadItem::AgentMessage {
+            id: "agent-1".to_string(),
+            text: "done".to_string(),
+            phase: None,
+            memory_citation: None,
+            delivery: None,
+            questions: None,
+        }
+    }
+
+    #[test]
+    fn unknown_sub_agent_activity_kind_does_not_fail_the_turn() {
+        let turn = stored_turn_to_api_turn(
+            stored_turn(vec![
+                stored_item(
+                    "agent-1",
+                    r#"{"type":"agentMessage","id":"agent-1","text":"done"}"#,
+                ),
+                // A `kind` this build does not know, as written by a newer Codex.
+                stored_item(
+                    "subagent-escalated-1",
+                    r#"{"type":"subAgentActivity","id":"subagent-escalated-1","kind":"escalated","agentThreadId":"0199c1f0-0000-7000-8000-000000000001","agentPath":"/root"}"#,
+                ),
+            ]),
+            TurnItemsView::Full,
+        );
+
+        assert_eq!(turn.items, vec![agent_message()]);
+    }
+
+    #[test]
+    fn unknown_thread_item_type_does_not_fail_the_turn() {
+        let turn = stored_turn_to_api_turn(
+            stored_turn(vec![
+                stored_item(
+                    "agent-1",
+                    r#"{"type":"agentMessage","id":"agent-1","text":"done"}"#,
+                ),
+                stored_item("future-1", r#"{"type":"futureItem","id":"future-1"}"#),
+            ]),
+            TurnItemsView::Full,
+        );
+
+        assert_eq!(turn.items, vec![agent_message()]);
+    }
+}
