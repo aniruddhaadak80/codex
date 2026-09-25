@@ -1209,7 +1209,8 @@
         "started",
         "interacted",
         "interrupted",
-        "completed"
+        "completed",
+        "unknown"
       ],
       "type": "string"
     },

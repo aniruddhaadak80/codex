@@ -5326,3 +5326,39 @@ fn tool_request_user_input_params_default_legacy_missing_is_blocking_to_true() {
         }
     );
 }
+
+#[test]
+fn deserializes_stored_sub_agent_activity_with_unknown_kind() {
+    // Regression test for #47959: a `subAgentActivity` item persisted by a
+    // newer build must not fail deserialization of the whole thread.
+    let item = json!({
+        "type": "subAgentActivity",
+        "id": "subagent-completed-0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "kind": "someFutureKind",
+        "agentThreadId": "0199ffff-0000-1111-2222-333333333333",
+        "agentPath": "/root/worker",
+    });
+
+    let parsed: ThreadItem =
+        serde_json::from_value(item).expect("unknown subAgentActivity kind must not fail");
+
+    assert_eq!(
+        parsed,
+        ThreadItem::SubAgentActivity {
+            id: "subagent-completed-0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+            kind: SubAgentActivityKind::Unknown,
+            agent_thread_id: "0199ffff-0000-1111-2222-333333333333".to_string(),
+            agent_path: "/root/worker".to_string(),
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(&parsed).expect("re-serialize"),
+        json!({
+            "type": "subAgentActivity",
+            "id": "subagent-completed-0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "kind": "unknown",
+            "agentThreadId": "0199ffff-0000-1111-2222-333333333333",
+            "agentPath": "/root/worker",
+        })
+    );
+}

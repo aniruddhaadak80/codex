@@ -1262,6 +1262,10 @@ pub enum SubAgentActivityKind {
     Interacted,
     Interrupted,
     Completed,
+    // Persisted by a newer build and unknown to this one. Keep the thread
+    // readable instead of failing to deserialize every stored item.
+    #[serde(other)]
+    Unknown,
 }
 
 impl From<CoreSubAgentActivityKind> for SubAgentActivityKind {

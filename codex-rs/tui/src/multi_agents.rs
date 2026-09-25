@@ -298,6 +298,7 @@ pub(crate) fn sub_agent_activity_display(item: &ThreadItem) -> Option<SubAgentAc
         SubAgentActivityKind::Started => true,
         SubAgentActivityKind::Interacted => return None,
         SubAgentActivityKind::Interrupted | SubAgentActivityKind::Completed => false,
+        SubAgentActivityKind::Unknown => false,
     };
     Some(SubAgentActivityDisplay {
         thread_id: parse_thread_id(agent_thread_id)?,
@@ -325,6 +326,7 @@ fn sub_agent_activity_title(kind: SubAgentActivityKind, agent_path: &str) -> Lin
         SubAgentActivityKind::Interacted => ("Interacted with ", agent_path),
         SubAgentActivityKind::Interrupted => ("Interrupted ", agent_path),
         SubAgentActivityKind::Completed => ("Completed ", agent_path),
+        SubAgentActivityKind::Unknown => ("Activity ", agent_path),
     };
     title_spans_line(vec![
         Span::from(prefix).bold(),
